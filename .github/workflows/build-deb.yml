@@ -1,0 +1,225 @@
+name: Build fcitx5-mcbopomofo DEB
+
+on:
+  schedule:
+    # 每天 UTC 04:00 (台灣時間 12:00 Asia/Taipei) 自動檢查上游新版本
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '強制重新編譯（即使 Release 已存在）'
+        type: boolean
+        default: false
+      target_tag:
+        description: '指定上游 Tag（留空則自動抓取最新 Release）'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.get_release.outputs.tag }}
+      should_build: ${{ steps.get_release.outputs.should_build }}
+    steps:
+      - name: 取得上游最新 Release Tag
+        id: get_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.target_tag }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG=$(gh release view --repo openvanilla/fcitx5-mcbopomofo --json tagName -q .tagName)
+          fi
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ] || [[ ! "$TAG" =~ ^[A-Za-z0-9.+~_-]+$ ]]; then
+            echo "錯誤：上游 Release Tag 格式無效或為空：'$TAG'" >&2
+            exit 1
+          fi
+
+          VERSION="${TAG#v}"
+          if [[ ! "$VERSION" =~ ^[0-9][A-Za-z0-9.+~:-]*$ ]]; then
+            echo "錯誤：轉換後 Debian 版本號格式無效：'$VERSION'" >&2
+            exit 1
+          fi
+
+          echo "上游目標版本：$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "已指定強制重新編譯。"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          REL_OUT=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>&1)
+          REL_RC=$?
+          set -e
+
+          if [ "$REL_RC" -eq 0 ]; then
+            echo "Release $TAG 已存在，跳過建置。"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          elif echo "$REL_OUT" | grep -qE 'HTTP 404|"status":[[:space:]]*"404"|"message":[[:space:]]*"Not Found"'; then
+            echo "偵測到新版本 $TAG，準備建置。"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "錯誤：檢查既有 Release 狀態失敗：$REL_OUT" >&2
+            exit 1
+          fi
+
+  build-deb:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['22.04', '24.04', '26.04']
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:${{ matrix.ubuntu }}
+    steps:
+      - name: 安裝編譯與打包相依套件
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git g++ pkg-config cmake extra-cmake-modules gettext \
+            dpkg-dev binutils file \
+            fcitx5 libfcitx5core-dev libfcitx5config-dev libfcitx5utils-dev fcitx5-modules-dev \
+            libfmt-dev libicu-dev libjson-c-dev
+
+      - name: 下載上游指定 Tag 原始碼
+        env:
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+        run: |
+          rm -rf src
+          git clone --branch "$TAG" --depth 1 https://github.com/openvanilla/fcitx5-mcbopomofo.git src
+
+      - name: CMake 編譯與 dpkg-deb 打包
+        env:
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+          UBUNTU_VER: ${{ matrix.ubuntu }}
+        run: |
+          VERSION="${TAG#v}"
+          ARCH="$(dpkg --print-architecture)"
+          PKG_VER="${VERSION}-1~ubuntu${UBUNTU_VER}"
+          DEB_NAME="fcitx5-mcbopomofo_${PKG_VER}_${ARCH}.deb"
+
+          cmake -S src -B build \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TEST=Off \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build build -j"$(nproc)"
+
+          rm -rf pkg shlibs
+          mkdir -p pkg/DEBIAN shlibs/debian
+          DESTDIR="$PWD/pkg" cmake --install build
+
+          # Strip ELF binaries / shared objects and detect runtime dependencies
+          mapfile -t ELF_FILES < <(find "$PWD/pkg" -type f -exec sh -c 'file -b "$1" | grep -q "^ELF "' _ {} \; -print)
+          if [ "${#ELF_FILES[@]}" -eq 0 ]; then
+            echo "錯誤：安裝目錄中未找到任何 ELF 二進位檔或共享函式庫。" >&2
+            exit 1
+          fi
+
+          strip --strip-unneeded "${ELF_FILES[@]}"
+
+          cat > shlibs/debian/control <<EOF
+          Source: fcitx5-mcbopomofo
+          Section: utils
+          Priority: optional
+          Maintainer: fcitx5-mcbopomofo-deb <noreply@github.com>
+
+          Package: fcitx5-mcbopomofo
+          Architecture: ${ARCH}
+          EOF
+
+          SHLIBS_DEPS=$(cd shlibs && dpkg-shlibdeps -O "${ELF_FILES[@]}" | grep '^shlibs:Depends=' | sed 's/^shlibs:Depends=//')
+          DEPENDS="fcitx5"
+          if [ -n "$SHLIBS_DEPS" ]; then
+            DEPENDS="fcitx5, ${SHLIBS_DEPS}"
+          fi
+          INSTALLED_SIZE=$(du -ks --exclude=DEBIAN pkg | awk '{print $1}')
+
+          cat > pkg/DEBIAN/control <<EOF
+          Package: fcitx5-mcbopomofo
+          Version: ${PKG_VER}
+          Section: utils
+          Priority: optional
+          Architecture: ${ARCH}
+          Installed-Size: ${INSTALLED_SIZE}
+          Depends: ${DEPENDS}
+          Maintainer: fcitx5-mcbopomofo-deb <noreply@github.com>
+          Homepage: https://github.com/openvanilla/fcitx5-mcbopomofo
+          Description: McBopomofo Input Method for Fcitx 5
+           Traditional Chinese phonetic (Bopomofo) input method engine for Fcitx 5.
+           Built from openvanilla/fcitx5-mcbopomofo (${TAG}) on Ubuntu ${UBUNTU_VER}.
+          EOF
+
+          chmod 0755 pkg/DEBIAN
+          chmod 0644 pkg/DEBIAN/control
+
+          mkdir -p dist
+          dpkg-deb --build --root-owner-group pkg "dist/${DEB_NAME}"
+          dpkg-deb --info "dist/${DEB_NAME}"
+          dpkg-deb --contents "dist/${DEB_NAME}"
+
+      - name: 套件安裝驗證
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y "./dist/"*.deb
+          dpkg -s fcitx5-mcbopomofo
+
+      - name: 上傳建置產物
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-ubuntu-${{ matrix.ubuntu }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish-release:
+    needs: [check-upstream, build-deb]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下載所有版本的 DEB 檔
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 檢查產物清單
+        run: ls -lh artifacts/*.deb
+
+      - name: 發布至 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.tag }}
+          name: "fcitx5-mcbopomofo ${{ needs.check-upstream.outputs.tag }}"
+          body: |
+            自動從 [openvanilla/fcitx5-mcbopomofo](https://github.com/openvanilla/fcitx5-mcbopomofo/releases/tag/${{ needs.check-upstream.outputs.tag }}) 編譯打包之 Ubuntu DEB 套件。
+
+            支援版本：
+            - Ubuntu 22.04 (`jammy`)
+            - Ubuntu 24.04 (`noble`)
+            - Ubuntu 26.04 (`resolute`)
+
+            安裝方式（請挑選對應系統版本之 `.deb`）：
+            ```bash
+            sudo apt install ./fcitx5-mcbopomofo_*_amd64.deb
+            ```
+          files: artifacts/*.deb
